@@ -12,7 +12,22 @@ env:
   DOCKERHUB_TOKEN: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
 
 jobs:
+  setup:
+    name: 🔧 setup
+    runs-on: ubuntu-latest
+    outputs:
+      dockerhub-token: ${{ steps.secrets.outputs.token }}
+      dockerhub-username: ${{ steps.secrets.outputs.username }}
+    steps:
+      - name: Load secrets
+        id: secrets
+        run: |
+          echo "username=${{ secrets.DOCKER_REGISTRY_USERNAME }}"
+          echo "token=${{ secrets.DOCKER_REGISTRY_TOKEN }}"
+
   docker-multiarch:
+    name: 🐋 docker
+    needs: [ setup ]
     uses: vionix-proj/shared-workflows/.github/workflows/docker-multiarch-cicd.yaml@main
     with:
       registry: ghcr.io
@@ -20,7 +35,6 @@ jobs:
       docker-compose-file-name: docker-compose.yaml
       dockerhub-registry: docker.io
       dockerhub-namespace: ${{ github.repository_owner }}
-      dockerhub-registry-username: ${{ env.DOCKERHUB_USERNAME }}
-      dockerhub-registry-token: ${{ env.DOCKERHUB_USERNAME }}
+      dockerhub-registry-username: ${{ needs.setup.outputs.dockerhub-username }}
+      dockerhub-registry-token: ${{ needs.setup.outputs.dockerhub-token }}
       push-attestations: "false"
-    secrets: inherit

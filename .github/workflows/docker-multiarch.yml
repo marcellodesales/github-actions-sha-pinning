@@ -28,7 +28,14 @@ jobs:
   docker-multiarch:
     name: 🐋 docker
     needs: [ setup ]
-    uses: vionix-proj/shared-workflows/.github/workflows/docker-multiarch-cicd.yaml@main
+    uses: vionix-proj/shared-workflows/.github/workflows/docker-multiarch-cicd.yaml@main 
+    permissions:
+      contents: write           # Make and push commits to the repo 
+      packages: write           # Create a docker package in the repo
+      id-token: write           # Acquire a github token 
+      attestations: write       # Submit attestations for the build
+      artifact-metadata: write  # Submit SBOM for the build
+      pull-requests: write      # Write back to the Pull Request
     with:
       registry: ghcr.io
       platforms: linux/amd64,linux/arm64

@@ -1,0 +1,70 @@
+name: 🐳 Docker PR Reviewer
+
+run-name: "🐳 Docker PR Reviewer for #${{ github.event.pull_request.number }}"
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: docker-pr-reviewer-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  docker-review:
+    name: 🐳 Review Docker build impact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Review Docker changes with shared Anthropic reviewer
+        uses: vionix-proj/actions/cloud-native/reviewer-docker@54c6bde17437fcfc6e9b5355d6be5113730d6e4d
+        with:
+          github-token: ${{ github.token }}
+
+          # Anthropic credentials/config
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic-base-url: ${{ vars.ANTHROPIC_BASE_URL || 'https://api.anthropic.com' }}
+          anthropic-version: "2023-06-01"
+          anthropic-models: "claude-opus-4-6,claude-sonnet-4-6,claude-haiku-4-5"
+          anthropic-max-tokens: "2200"
+          anthropic-temperature: "0.2"
+          anthropic-request-timeout-seconds: "120"
+
+          # Retry behavior
+          max-attempts-per-model: "5"
+          initial-retry-sleep-seconds: "3"
+          fail-on-anthropic-error: "false"
+
+          # Prompt sizing
+          pr-body-max-chars: "8000"
+          docker-patches-max-chars: "24000"
+          all-files-max-chars: "8000"
+
+          # Reviewer behavior
+          require-docker-changes: "true"
+          include-ci-signal: "true"
+          publish-summary: "true"
+          post-comment: "true"
+          update-existing-comment: "true"
+
+          # PR comment/review formatting
+          review-title: "## 🐳 Docker Build Review"
+          comment-marker: "## 🐳 Docker Build Review"
+
+          # Optional repo-specific guidance appended to the shared Docker reviewer prompt
+          extra-prompt: |
+            Prefer PASS only when Docker-related changes appear low-risk and CI/checks are passing.
+            Use HOLD when CI is failing or the update includes major runtime, base image, compiler, SDK, package-manager, multi-arch, or Docker Compose changes.
+            Use INVESTIGATE when repository-specific Docker runtime behavior cannot be determined from PR metadata, diffs, and CI/check signal alone.
+            If CI signal is missing, truncated, or inconclusive, say exactly what follow-up Docker build, Docker Compose, or workflow validation should be inspected.

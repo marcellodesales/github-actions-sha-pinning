@@ -1,0 +1,447 @@
+name: 🐳 Docker Multiarch PR Reviewer
+
+run-name: "🐳 Docker Multiarch PR Reviewer for docker-image-cicd run #${{ github.event.workflow_run.run_number }}"
+
+on:
+  workflow_run:
+    workflows:
+      - docker-image-cicd
+    types:
+      - completed
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: docker-multiarch-pr-reviewer-${{ github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  docker-review:
+    name: 🐳 Review Docker multiarch build result
+    if: ${{ github.event.workflow_run.event == 'pull_request' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve PR and collect Docker-related changes
+        id: pr
+        uses: actions/github-script@v9.0.0
+        env:
+          PR_BODY_MAX_CHARS: "8000"
+          DOCKER_PATCHES_MAX_CHARS: "24000"
+          ALL_FILES_MAX_CHARS: "8000"
+          DOCKER_FILE_PATTERN_REGEX: '(^|/)(Dockerfile([._-].*)?|.*\.Dockerfile|Containerfile([._-].*)?|.*\.Containerfile|docker-compose([._-].*)?\.ya?ml|compose([._-].*)?\.ya?ml|\.dockerignore)$'
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+
+            const { owner, repo } = context.repo;
+            const workflowRun = context.payload.workflow_run;
+            const prRef = workflowRun.pull_requests?.[0];
+
+            function truncate(value, maxChars) {
+              const text = String(value || '');
+              if (text.length <= maxChars) return text;
+              return `${text.slice(0, maxChars)}\n\n...[truncated ${text.length - maxChars} chars]`;
+            }
+
+            if (!prRef?.number) {
+              core.warning('No pull request was associated with this workflow_run event.');
+              core.setOutput('should_review', 'false');
+              return;
+            }
+
+            const pull_number = prRef.number;
+
+            const { data: pull } = await github.rest.pulls.get({ owner, repo, pull_number });
+
+            const dockerPattern = new RegExp(process.env.DOCKER_FILE_PATTERN_REGEX, 'i');
+            const dockerPatchMaxChars = Number(process.env.DOCKER_PATCHES_MAX_CHARS || 24000);
+            const allFilesMaxChars = Number(process.env.ALL_FILES_MAX_CHARS || 8000);
+            const prBodyMaxChars = Number(process.env.PR_BODY_MAX_CHARS || 8000);
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number,
+              per_page: 100,
+            });
+
+            const dockerFiles = files.filter(file => dockerPattern.test(file.filename));
+
+            const allChangedFilesMarkdown = truncate(
+              files.map(file => `- ${file.status}: ${file.filename} (+${file.additions}/-${file.deletions})`).join('\n'),
+              allFilesMaxChars,
+            );
+
+            const dockerPatchesMarkdown = truncate(
+              dockerFiles.map(file => {
+                const patch = file.patch || '_No patch available from GitHub API. The file may be too large, binary, renamed without textual diff, or generated._';
+                return [
+                  `### ${file.filename}`,
+                  `- Status: ${file.status}`,
+                  `- Additions: ${file.additions}`,
+                  `- Deletions: ${file.deletions}`,
+                  `- Changes: ${file.changes}`,
+                  '',
+                  '```diff',
+                  patch,
+                  '```',
+                ].join('\n');
+              }).join('\n\n'),
+              dockerPatchMaxChars,
+            );
+
+            fs.writeFileSync('all-changed-files.md', allChangedFilesMarkdown || '_No changed files returned by GitHub API._');
+            fs.writeFileSync('docker-patches.md', dockerPatchesMarkdown || '_No Docker-related file patches detected._');
+
+            core.setOutput('should_review', dockerFiles.length > 0 ? 'true' : 'false');
+            core.setOutput('pr_number', String(pull_number));
+            core.setOutput('pr_title', pull.title || '');
+            core.setOutput('pr_body_truncated', truncate(pull.body || '', prBodyMaxChars));
+            core.setOutput('pr_head_sha', pull.head.sha || '');
+            core.setOutput('pr_head_ref', pull.head.ref || '');
+            core.setOutput('pr_base_ref', pull.base.ref || '');
+            core.setOutput('changed_file_count', String(files.length));
+            core.setOutput('docker_file_count', String(dockerFiles.length));
+            core.setOutput('docker_files', dockerFiles.map(file => file.filename).join('\n'));
+
+      - name: Skip when no Docker-related files changed
+        if: ${{ steps.pr.outputs.should_review != 'true' }}
+        shell: bash
+        run: |
+          echo "No Dockerfile, Containerfile, docker-compose, compose, or .dockerignore changes detected. Skipping Docker review."
+
+      - name: Download docker-image-cicd job logs
+        id: logs
+        if: ${{ steps.pr.outputs.should_review == 'true' }}
+        uses: actions/github-script@v9.0.0
+        env:
+          WORKFLOW_LOG_MAX_CHARS: "60000"
+          DOCKER_JOB_NAME_REGEX: '(docker|build|multiarch|image|compose|🐋)'
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+
+            const { owner, repo } = context.repo;
+            const workflowRun = context.payload.workflow_run;
+            const run_id = workflowRun.id;
+            const attempt_number = workflowRun.run_attempt || 1;
+            const maxChars = Number(process.env.WORKFLOW_LOG_MAX_CHARS || 60000);
+            const dockerJobPattern = new RegExp(process.env.DOCKER_JOB_NAME_REGEX || '(docker|build|multiarch|image|compose|🐋)', 'i');
+
+            function asText(data) {
+              if (typeof data === 'string') return data;
+              if (Buffer.isBuffer(data)) return data.toString('utf8');
+              if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8');
+              if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer).toString('utf8');
+              return String(data || '');
+            }
+
+            function truncate(value, maxChars) {
+              const text = String(value || '');
+              if (text.length <= maxChars) return text;
+              return `${text.slice(0, maxChars)}\n\n...[truncated ${text.length - maxChars} chars]`;
+            }
+
+            let jobs = [];
+
+            try {
+              const response = await github.rest.actions.listJobsForWorkflowRunAttempt({
+                owner,
+                repo,
+                run_id,
+                attempt_number,
+                per_page: 100,
+              });
+              jobs = response.data.jobs || [];
+            } catch (error) {
+              core.warning(`Could not list jobs for workflow run attempt ${attempt_number}; falling back to run-level jobs: ${error.message}`);
+              const response = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id, per_page: 100 });
+              jobs = response.data.jobs || [];
+            }
+
+            const matchingJobs = jobs.filter(job => dockerJobPattern.test(job.name || ''));
+            const jobsToDownload = matchingJobs.length > 0 ? matchingJobs : jobs;
+
+            const logSections = [];
+            logSections.push('# Workflow run');
+            logSections.push(`- Workflow: ${workflowRun.name}`);
+            logSections.push(`- Run ID: ${workflowRun.id}`);
+            logSections.push(`- Run number: ${workflowRun.run_number}`);
+            logSections.push(`- Attempt: ${attempt_number}`);
+            logSections.push(`- Event: ${workflowRun.event}`);
+            logSections.push(`- Status: ${workflowRun.status}`);
+            logSections.push(`- Conclusion: ${workflowRun.conclusion}`);
+            logSections.push(`- URL: ${workflowRun.html_url}`);
+            logSections.push('');
+            logSections.push('# Jobs discovered');
+            for (const job of jobs) {
+              logSections.push(`- ${job.name} | status=${job.status} | conclusion=${job.conclusion} | id=${job.id}`);
+            }
+            logSections.push('');
+            logSections.push('# Downloaded job logs');
+            logSections.push(`Downloaded ${jobsToDownload.length} job log(s). Preferred jobs matched regex: \`${process.env.DOCKER_JOB_NAME_REGEX}\`.`);
+            logSections.push('');
+
+            for (const job of jobsToDownload) {
+              logSections.push(`## Job: ${job.name}`);
+              logSections.push(`- Job ID: ${job.id}`);
+              logSections.push(`- Status: ${job.status}`);
+              logSections.push(`- Conclusion: ${job.conclusion}`);
+              logSections.push(`- Started: ${job.started_at}`);
+              logSections.push(`- Completed: ${job.completed_at}`);
+              logSections.push('');
+
+              try {
+                const response = await github.request('GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs', {
+                  owner,
+                  repo,
+                  job_id: job.id,
+                });
+                logSections.push('```text');
+                logSections.push(asText(response.data));
+                logSections.push('```');
+              } catch (error) {
+                logSections.push(`_Failed to download logs for job ${job.id}: ${error.message}_`);
+              }
+              logSections.push('');
+            }
+
+            const combinedLogs = truncate(logSections.join('\n'), maxChars);
+            fs.writeFileSync('docker-workflow-logs.txt', combinedLogs);
+
+            core.setOutput('workflow_conclusion', workflowRun.conclusion || 'unknown');
+            core.setOutput('workflow_status', workflowRun.status || 'unknown');
+            core.setOutput('downloaded_job_count', String(jobsToDownload.length));
+
+      - name: Build Docker review prompt
+        id: prompt
+        if: ${{ steps.pr.outputs.should_review == 'true' }}
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          WORKFLOW_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          WORKFLOW_CONCLUSION: ${{ steps.logs.outputs.workflow_conclusion }}
+          WORKFLOW_STATUS: ${{ steps.logs.outputs.workflow_status }}
+          DOWNLOADED_JOB_COUNT: ${{ steps.logs.outputs.downloaded_job_count }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          PR_TITLE: ${{ steps.pr.outputs.pr_title }}
+          PR_BODY_TRUNCATED: ${{ steps.pr.outputs.pr_body_truncated }}
+          PR_HEAD_SHA: ${{ steps.pr.outputs.pr_head_sha }}
+          PR_HEAD_REF: ${{ steps.pr.outputs.pr_head_ref }}
+          PR_BASE_REF: ${{ steps.pr.outputs.pr_base_ref }}
+          CHANGED_FILE_COUNT: ${{ steps.pr.outputs.changed_file_count }}
+          DOCKER_FILE_COUNT: ${{ steps.pr.outputs.docker_file_count }}
+          DOCKER_FILES: ${{ steps.pr.outputs.docker_files }}
+          EXTRA_PROMPT: |
+            This review runs after docker-image-cicd finishes, so treat the workflow logs as first-class evidence.
+            Focus on whether the Docker build actually succeeded, why it failed if it failed, and whether the Dockerfile/Compose changes are likely responsible.
+            Recommend HOLD when the Docker workflow conclusion is failure, timed_out, cancelled, or action_required unless the logs clearly show an unrelated infrastructure issue.
+            If logs are truncated or inconclusive, say exactly what follow-up command or job log should be inspected.
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          all_changed_files = Path('all-changed-files.md').read_text(encoding='utf-8') if Path('all-changed-files.md').exists() else '_No changed-file list available._'
+          docker_patches = Path('docker-patches.md').read_text(encoding='utf-8') if Path('docker-patches.md').exists() else '_No Docker-related patches available._'
+          workflow_logs = Path('docker-workflow-logs.txt').read_text(encoding='utf-8') if Path('docker-workflow-logs.txt').exists() else '_No workflow logs were downloaded._'
+
+          prompt = f'''You are reviewing a pull request after the Docker build workflow has completed.
+
+          The upstream workflow is `.github/workflows/docker-multiarch.yml`, named `docker-image-cicd`.
+          The key job in that workflow is the reusable Docker build job named `🐋 docker`.
+
+          REPO: {os.environ.get('REPO')}
+          PR NUMBER: {os.environ.get('PR_NUMBER')}
+          PR TITLE: {os.environ.get('PR_TITLE')}
+          BASE REF: {os.environ.get('PR_BASE_REF')}
+          HEAD REF: {os.environ.get('PR_HEAD_REF')}
+          HEAD SHA: {os.environ.get('PR_HEAD_SHA')}
+
+          PR BODY:
+          {os.environ.get('PR_BODY_TRUNCATED') or '_No PR body provided._'}
+
+          WORKFLOW RESULT
+          - Workflow name: {os.environ.get('WORKFLOW_NAME')}
+          - Workflow run ID: {os.environ.get('WORKFLOW_RUN_ID')}
+          - Workflow run number: {os.environ.get('WORKFLOW_RUN_NUMBER')}
+          - Workflow status: {os.environ.get('WORKFLOW_STATUS') or 'unknown'}
+          - Workflow conclusion: {os.environ.get('WORKFLOW_CONCLUSION') or 'unknown'}
+          - Downloaded job logs: {os.environ.get('DOWNLOADED_JOB_COUNT') or '0'}
+          - Workflow URL: {os.environ.get('WORKFLOW_RUN_URL')}
+
+          CHANGE SUMMARY
+          - Changed files total: {os.environ.get('CHANGED_FILE_COUNT') or '0'}
+          - Docker-related files count: {os.environ.get('DOCKER_FILE_COUNT') or '0'}
+
+          DOCKER-RELATED FILES
+          ```text
+          {os.environ.get('DOCKER_FILES') or '_No Docker-related files detected._'}
+          ```
+
+          ALL CHANGED FILES
+          {all_changed_files}
+
+          DOCKER-RELATED PATCHES
+          {docker_patches}
+
+          DOCKER WORKFLOW / JOB LOGS
+          ```text
+          {workflow_logs}
+          ```
+
+          REVIEW FOCUS
+          Be very focused on the Docker build process. Review what can be inferred from Dockerfile, Containerfile, docker-compose, compose YAML, .dockerignore diffs, changed file paths, docker-image-cicd workflow result, and downloaded job logs.
+
+          Analyze whether the Docker build passed, failed, timed out, or was cancelled; identify likely failing commands/stages/images/platforms/services; determine whether the PR's Docker changes plausibly caused the outcome; and assess Dockerfile, Compose, .dockerignore, build context, multi-arch, and CI validation risks.
+
+          OUTPUT FORMAT
+          Return markdown only with these sections:
+          - Risk level: LOW | MEDIUM | HIGH
+          - Recommendation: PASS | HOLD | INVESTIGATE
+          - Workflow result summary
+          - Root-cause analysis from logs
+          - Docker build findings
+          - Docker Compose findings
+          - .dockerignore / build context findings
+          - CI/build validation gaps
+          - Next actions
+
+          Be specific. Reference exact file paths and log lines/messages when possible. If a concern is speculative because logs or diffs are truncated, label it as "verify". Do not claim that you ran Docker commands yourself.
+
+          ADDITIONAL REVIEW INSTRUCTIONS
+          {os.environ.get('EXTRA_PROMPT') or ''}
+          '''
+
+          Path('docker-review-prompt.md').write_text(prompt, encoding='utf-8')
+
+          review = f'''## 🐳 Docker Build Review
+
+          ### Workflow context
+          - **Source workflow**: `{os.environ.get('WORKFLOW_NAME')}`
+          - **Workflow run**: `{os.environ.get('WORKFLOW_RUN_NUMBER')}`
+          - **Workflow conclusion**: `{os.environ.get('WORKFLOW_CONCLUSION') or 'unknown'}`
+          - **Workflow URL**: {os.environ.get('WORKFLOW_RUN_URL')}
+
+          ### Docker review context
+          - **Changed files**: `{os.environ.get('CHANGED_FILE_COUNT') or '0'}` total
+          - **Docker-related files**: `{os.environ.get('DOCKER_FILE_COUNT') or '0'}`
+
+          ### Docker-related files reviewed
+          ```text
+          {os.environ.get('DOCKER_FILES') or '_No Docker-related files detected._'}
+          ```
+
+          ### 1) Docker build/process review scope
+          - Reviewed Dockerfile, Containerfile, Docker Compose, and `.dockerignore` changes.
+          - Included completed `docker-image-cicd` workflow/job logs as review evidence.
+          - This reviewer does **not** execute Docker commands; it analyzes PR diffs plus workflow logs.
+
+          '''
+          Path('review.md').write_text(review, encoding='utf-8')
+          PY
+
+          delimiter="docker_review_prompt_$(date +%s%N)"
+          {
+            echo "prompt<<${delimiter}"
+            cat docker-review-prompt.md
+            echo "${delimiter}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: AI Docker build review
+        id: anthropic-review
+        if: ${{ steps.pr.outputs.should_review == 'true' }}
+        uses: vionix-proj/actions/ai/anthropic/claude-codereviewer@main
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic-base-url: ${{ vars.ANTHROPIC_BASE_URL || 'https://api.anthropic.com' }}
+          anthropic-version: "2023-06-01"
+          anthropic-models: "claude-opus-4-6,claude-sonnet-4-6,claude-haiku-4-5"
+          anthropic-max-tokens: "2200"
+          anthropic-temperature: "0.2"
+          anthropic-request-timeout-seconds: "120"
+          max-attempts-per-model: "5"
+          initial-retry-sleep-seconds: "3"
+          fail-on-anthropic-error: "false"
+          output-file: ai-opinion.md
+          prompt: ${{ steps.prompt.outputs.prompt }}
+
+      - name: Append AI opinion to unified review
+        if: ${{ steps.pr.outputs.should_review == 'true' }}
+        shell: bash
+        run: |
+          {
+            echo "### 2) AI Docker build risk opinion"
+            echo
+
+            if [[ -s ai-opinion.md ]]; then
+              cat ai-opinion.md
+            else
+              echo "_Skipped: AI opinion not generated._"
+            fi
+          } >> review.md
+
+      - name: Publish job summary
+        if: ${{ steps.pr.outputs.should_review == 'true' }}
+        shell: bash
+        run: |
+          cat review.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upsert PR comment
+        if: ${{ steps.pr.outputs.should_review == 'true' }}
+        uses: actions/github-script@v9.0.0
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          COMMENT_MARKER: "## 🐳 Docker Build Review"
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+
+            const body = fs.readFileSync('review.md', 'utf8');
+            const marker = process.env.COMMENT_MARKER;
+            const issue_number = Number(process.env.PR_NUMBER);
+            const { owner, repo } = context.repo;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const existing = comments.find(comment =>
+              comment.user?.type === 'Bot' &&
+              comment.body &&
+              comment.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }

@@ -5,8 +5,7 @@ updates:
     schedule:
       interval: "monthly"
       time: "12:00"
-      timezone: "Asia/Tokyo"
-    # To avoid lock file conflicts, group all updates together.
+      timezone: "Americas/Los_Angeles"
     groups:
       gomod-all:
         patterns:

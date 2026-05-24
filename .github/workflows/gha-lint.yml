@@ -15,5 +15,5 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: Finatext/workflows-public/.github/workflows/gha-lint.yml@main
+    uses: marcellodesales/github-actions-sha-pinning/.github/workflows/gha-lint.yml@main
     secrets: inherit
